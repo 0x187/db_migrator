@@ -1,0 +1,4 @@
+{
+  "sqlserver_connection_string": "sqlserver://sa:YourStrong@Password@localhost:1433?database=SourceDB",
+  "mysql_connection_string": "root:YourPassword@tcp(127.0.0.1:3306)/DestinationDB?parseTime=true"
+}
