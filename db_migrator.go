@@ -1,26 +1,32 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
+	"math"
 	"os"
+	"runtime"
 	"strings"
+	"sync"
 
-	// SQL Server driver
 	_ "github.com/denisenkom/go-mssqldb"
-	// MySQL driver
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 )
 
-// Config struct holds the database connection strings read from the JSON file.
+// CONFIGURATION
+// Holds the database connection strings.
 type Config struct {
 	SQLServerConnectionString string `json:"sqlserver_connection_string"`
 	MySQLConnectionString     string `json:"mysql_connection_string"`
 }
 
-// ColumnSchema holds the structure of a database column.
+// ColumnSchema defines the structure of a table column from the source DB.
 type ColumnSchema struct {
 	Name             string
 	Type             string
@@ -30,137 +36,277 @@ type ColumnSchema struct {
 	NumericScale     sql.NullInt64
 }
 
-// BATCH_SIZE defines how many rows are inserted in a single bulk INSERT statement.
-const BATCH_SIZE = 500
-
-func main() {
-	// 0. Load configuration from config.json
-	config, err := loadConfig("config.json")
-	if err != nil {
-		log.Fatalf("Error loading configuration: %v", err)
-	}
-	fmt.Println("⚙️ Configuration loaded successfully from config.json.")
-
-	// 1. Connect to databases
-	sourceDB, err := connectToDB("sqlserver", config.SQLServerConnectionString, "SQL Server")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer sourceDB.Close()
-
-	destDB, err := connectToDB("mysql", config.MySQLConnectionString, "MySQL")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer destDB.Close()
-
-	// 2. Get the list of tables
-	tables, err := getSourceTables(sourceDB)
-	if err != nil {
-		log.Fatalf("Error getting table list: %v", err)
-	}
-	if len(tables) == 0 {
-		fmt.Println("⚠️ No tables found in the source database.")
-		return
-	}
-	fmt.Printf("🔍 Found %d tables to migrate. Starting process...\n", len(tables))
-
-	// 3. Start the migration process
-	var successfulTables, failedTables []string
-	for _, tableName := range tables {
-		fmt.Printf("\n--------------------------------------------------\n")
-		fmt.Printf(" MIGRATING TABLE: %s\n", tableName)
-		fmt.Printf("--------------------------------------------------\n")
-
-		err := migrateTable(sourceDB, destDB, tableName)
-		if err != nil {
-			log.Printf("❌ [ERROR] Migration failed for table '%s': %v", tableName, err)
-			failedTables = append(failedTables, tableName)
-		} else {
-			fmt.Printf("✅ [SUCCESS] Table '%s' migrated successfully.\n", tableName)
-			successfulTables = append(successfulTables, tableName)
-		}
-	}
-
-	// 4. Display migration summary
-	fmt.Println("\n================= MIGRATION SUMMARY =================")
-	fmt.Printf("Total tables processed: %d\n", len(tables))
-	fmt.Printf("✅ Successful: %d\n", len(successfulTables))
-	fmt.Printf("❌ Failed: %d\n", len(failedTables))
-	if len(failedTables) > 0 {
-		fmt.Printf("Failed tables: %s\n", strings.Join(failedTables, ", "))
-	}
-	fmt.Println("=====================================================")
+// PrimaryKeyInfo holds information about a table's primary key.
+type PrimaryKeyInfo struct {
+	ColumnName string
+	IsNumeric  bool
 }
 
-// migrateTable manages the entire migration process for a single table.
-func migrateTable(sourceDB, destDB *sql.DB, tableName string) error {
-	// Step 1: Get table schema
-	schema, err := getTableSchema(sourceDB, tableName)
+// NEW: A threshold to decide if a table is "large" and should be chunked.
+const largeTableThreshold int64 = 100000 // e.g., 100,000 rows
+
+// main is the entry point of the application.
+func main() {
+	// --- Configuration Loading ---
+	configFile, err := os.Open("config.json")
 	if err != nil {
-		return fmt.Errorf("could not get table schema: %w", err)
+		log.Fatalf("FATAL: Could not open config.json. Error: %v", err)
 	}
-	fmt.Println("  [1/4] ✔️ Table schema fetched.")
+	defer configFile.Close()
 
-	// Step 2: Get primary key
-	primaryKeys, err := getPrimaryKey(sourceDB, tableName)
+	byteValue, _ := ioutil.ReadAll(configFile)
+	var config Config
+	json.Unmarshal(byteValue, &config)
+
+	if config.SQLServerConnectionString == "" || config.MySQLConnectionString == "" {
+		log.Fatal("FATAL: Connection strings in config.json cannot be empty.")
+	}
+
+	// --- Database Connections ---
+	sqlserverDB, err := sql.Open("sqlserver", config.SQLServerConnectionString)
 	if err != nil {
-		return fmt.Errorf("could not get primary key: %w", err)
+		log.Fatalf("FATAL: Failed to create SQL Server connection pool. Error: %v", err)
 	}
-	fmt.Println("  [2/4] ✔️ Primary key fetched.")
+	defer sqlserverDB.Close()
 
-	// Step 3: Create table in the destination
-	createStatement := generateCreateTableSQL(tableName, schema, primaryKeys)
-	if _, err := destDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`;", tableName)); err != nil {
-		return fmt.Errorf("could not drop existing table: %w", err)
-	}
-	if _, err := destDB.Exec(createStatement); err != nil {
-		return fmt.Errorf("could not create table: %w", err)
-	}
-	fmt.Println("  [3/4] ✔️ Table created in destination.")
-
-	// Step 4: Copy data
-	err = copyTableData(sourceDB, destDB, tableName)
+	mysqlDB, err := sql.Open("mysql", config.MySQLConnectionString)
 	if err != nil {
-		return fmt.Errorf("could not copy table data: %w", err)
+		log.Fatalf("FATAL: Failed to create MySQL connection pool. Error: %v", err)
 	}
-	fmt.Println("  [4/4] ✔️ Table data copied.")
+	defer mysqlDB.Close()
 
+	// Set connection pool limits for better performance
+	sqlserverDB.SetMaxOpenConns(runtime.NumCPU() * 2)
+	mysqlDB.SetMaxOpenConns(runtime.NumCPU() * 2)
+
+	log.Println("Pinging databases...")
+	if err := sqlserverDB.Ping(); err != nil {
+		log.Fatalf("FATAL: Cannot ping SQL Server. Check connection string and network. Error: %v", err)
+	}
+	if err := mysqlDB.Ping(); err != nil {
+		log.Fatalf("FATAL: Cannot ping MySQL. Check connection string and network. Error: %v", err)
+	}
+	log.Println("SUCCESS: Both databases are connected.")
+
+	// --- Migration Process ---
+	tables, err := getTables(sqlserverDB)
+	if err != nil {
+		log.Fatalf("FATAL: Could not fetch table list from source. Error: %v", err)
+	}
+	if len(tables) == 0 {
+		log.Println("No user tables found to migrate. Exiting.")
+		return
+	}
+
+	log.Printf("Found %d tables to migrate. Starting process...", len(tables))
+
+	var wg sync.WaitGroup
+	// NEW: Professional progress bar container
+	p := mpb.New(mpb.WithWaitGroup(&wg), mpb.WithWidth(60))
+
+	// NEW: Channel to collect errors from workers
+	errorChan := make(chan string, len(tables))
+
+	// Determine the number of concurrent table migrations
+	maxWorkers := runtime.NumCPU()
+	if len(tables) < maxWorkers {
+		maxWorkers = len(tables)
+	}
+	tableChan := make(chan string, len(tables))
+	for _, table := range tables {
+		tableChan <- table
+	}
+	close(tableChan)
+
+	// Start worker pool for processing tables
+	for i := 0; i < maxWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for tableName := range tableChan {
+				migrateTable(sqlserverDB, mysqlDB, tableName, p, errorChan)
+			}
+		}()
+	}
+
+	p.Wait()
+
+	// After all workers are done, check for errors
+	close(errorChan)
+	var migrationErrors []string
+	for errStr := range errorChan {
+		migrationErrors = append(migrationErrors, errStr)
+	}
+
+	fmt.Println("\n--- Migration Summary ---")
+	if len(migrationErrors) > 0 {
+		fmt.Printf("❌ Migration finished with %d errors:\n", len(migrationErrors))
+		for _, errMsg := range migrationErrors {
+			fmt.Printf("- %s\n", errMsg)
+		}
+	} else {
+		fmt.Println("✅ Migration completed successfully for all tables!")
+	}
+}
+
+// migrateTable handles the migration of a single table, deciding if it should be chunked.
+func migrateTable(sqlserverDB, mysqlDB *sql.DB, tableName string, p *mpb.Progress, errorChan chan<- string) {
+	// 1. Get row count to determine strategy
+	var rowCount int64
+	err := sqlserverDB.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM [%s] WITH (NOLOCK)", tableName)).Scan(&rowCount)
+	if err != nil {
+		errorChan <- fmt.Sprintf("Table [%s]: Failed to get row count: %v", tableName, err)
+		return
+	}
+
+	// 2. Get table schema and PK info
+	columns, err := getTableSchema(sqlserverDB, tableName)
+	if err != nil {
+		errorChan <- fmt.Sprintf("Table [%s]: Failed to get schema: %v", tableName, err)
+		return
+	}
+	pkInfo, err := getPrimaryKey(sqlserverDB, tableName)
+	if err != nil {
+		errorChan <- fmt.Sprintf("Table [%s]: Failed to get primary key: %v", tableName, err)
+		return
+	}
+
+	// 3. Create table in MySQL
+	createStatement := generateCreateTableStatement(tableName, columns, pkInfo)
+	if _, err := mysqlDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", tableName)); err != nil {
+		errorChan <- fmt.Sprintf("Table [%s]: Failed to drop existing table in MySQL: %v", tableName, err)
+		return
+	}
+	if _, err := mysqlDB.Exec(createStatement); err != nil {
+		errorChan <- fmt.Sprintf("Table [%s]: Failed to create table in MySQL: %v\nSQL: %s", tableName, err, createStatement)
+		return
+	}
+
+	// 4. Decide migration strategy: chunked or single-threaded
+	if rowCount > largeTableThreshold && pkInfo.IsNumeric {
+		// Use the advanced chunking method for large tables
+		err = migrateLargeTableInChunks(sqlserverDB, mysqlDB, tableName, rowCount, pkInfo, p, errorChan)
+	} else {
+		// Use the standard method for smaller tables or tables without numeric PK
+		err = migrateSmallTable(sqlserverDB, mysqlDB, tableName, rowCount, p, errorChan)
+	}
+
+	if err != nil {
+		// Specific errors are already sent to the channel inside the functions
+		// This is a fallback
+		errorChan <- fmt.Sprintf("Table [%s]: Migration failed with error: %v", tableName, err)
+	}
+}
+
+// migrateSmallTable copies data for a small table in a single thread.
+func migrateSmallTable(sourceDB, destDB *sql.DB, tableName string, totalRows int64, p *mpb.Progress, errorChan chan<- string) error {
+	bar := p.AddBar(totalRows,
+		mpb.PrependDecorators(
+			decor.Name(fmt.Sprintf("%-25.25s", tableName), decor.WC{W: 25, C: decor.DidentRight}),
+			decor.Counters(0, "%d / %d", decor.WC{W: 15, C: decor.DidentRight}),
+		),
+		mpb.AppendDecorators(
+			decor.Percentage(decor.WC{W: 5}),
+			decor.NewAverageETA(decor.ET_STYLE_GO, decor.WC{W: 8}),
+		),
+	)
+
+	rows, err := sourceDB.QueryContext(context.Background(), fmt.Sprintf("SELECT * FROM [%s] WITH (NOLOCK)", tableName))
+	if err != nil {
+		bar.Abort(false)
+		return err
+	}
+	defer rows.Close()
+
+	return copyData(destDB, tableName, rows, bar)
+}
+
+// NEW: migrateLargeTableInChunks parallelizes the migration of one large table.
+func migrateLargeTableInChunks(sourceDB, destDB *sql.DB, tableName string, totalRows int64, pkInfo PrimaryKeyInfo, p *mpb.Progress, errorChan chan<- string) error {
+	// 1. Get min and max of the primary key to create chunks
+	var minPK, maxPK int64
+	pkQuery := fmt.Sprintf("SELECT MIN([%s]), MAX([%s]) FROM [%s] WITH (NOLOCK)", pkInfo.ColumnName, pkInfo.ColumnName, tableName)
+	err := sourceDB.QueryRow(pkQuery).Scan(&minPK, &maxPK)
+	if err != nil || (minPK == 0 && maxPK == 0) {
+		// Fallback to small table migration if we can't get a valid range
+		return migrateSmallTable(sourceDB, destDB, tableName, totalRows, p, errorChan)
+	}
+
+	bar := p.AddBar(totalRows,
+		mpb.PrependDecorators(
+			decor.Name(fmt.Sprintf("%-25.25s", tableName), decor.WC{W: 25, C: decor.DidentRight}),
+			decor.Counters(0, "%d / %d", decor.WC{W: 15, C: decor.DidentRight}),
+		),
+		mpb.AppendDecorators(
+			decor.Percentage(decor.WC{W: 5}),
+			decor.Name("chunking", decor.WC{W: 8, C: decor.Dcolor}),
+		),
+	)
+
+	// 2. Calculate chunk size and number of workers
+	numWorkers := runtime.NumCPU()
+	rangeSize := maxPK - minPK + 1
+	chunkSize := int64(math.Ceil(float64(rangeSize) / float64(numWorkers)))
+	if chunkSize < 1 {
+		chunkSize = 1
+	}
+
+	var chunkWg sync.WaitGroup
+	chunkErrorChan := make(chan error, numWorkers)
+
+	for i := 0; i < numWorkers; i++ {
+		startPK := minPK + (int64(i) * chunkSize)
+		endPK := startPK + chunkSize - 1
+
+		if startPK > maxPK {
+			continue // No more data to process
+		}
+
+		chunkWg.Add(1)
+		go func(start, end int64) {
+			defer chunkWg.Done()
+
+			// Each goroutine needs its own DB connection from the pool
+			conn, err := sourceDB.Conn(context.Background())
+			if err != nil {
+				chunkErrorChan <- err
+				return
+			}
+			defer conn.Close()
+
+			query := fmt.Sprintf("SELECT * FROM [%s] WITH (NOLOCK) WHERE [%s] BETWEEN %d AND %d", tableName, pkInfo.ColumnName, start, end)
+			rows, err := conn.QueryContext(context.Background(), query)
+			if err != nil {
+				chunkErrorChan <- err
+				return
+			}
+			defer rows.Close()
+
+			err = copyData(destDB, tableName, rows, bar)
+			if err != nil {
+				chunkErrorChan <- err
+			}
+		}(startPK, endPK)
+	}
+
+	chunkWg.Wait()
+	close(chunkErrorChan)
+
+	// Check if any chunk had an error
+	for err := range chunkErrorChan {
+		bar.Abort(false)
+		return err // Return the first error encountered
+	}
+
+	bar.SetTotal(bar.Current(), true) // Mark as complete
 	return nil
 }
 
-// connectToDB is a helper function to connect and ping a database.
-func connectToDB(driver, dsn, dbName string) (*sql.DB, error) {
-	db, err := sql.Open(driver, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("error preparing connection to %s: %w", dbName, err)
-	}
-	if err := db.Ping(); err != nil {
-		return nil, fmt.Errorf("could not connect to %s: %w", dbName, err)
-	}
-	fmt.Printf("✅ Successfully connected to %s.\n", dbName)
-	return db, nil
-}
+// --- Database Utility Functions ---
 
-// loadConfig loads configuration from a JSON file.
-func loadConfig(filename string) (*Config, error) {
-	file, err := os.ReadFile(filename)
-	if err != nil {
-		return nil, fmt.Errorf("configuration file '%s' not found: %w", filename, err)
-	}
-
-	var config Config
-	err = json.Unmarshal(file, &config)
-	if err != nil {
-		return nil, fmt.Errorf("error parsing configuration file: %w", err)
-	}
-	return &config, nil
-}
-
-// getSourceTables returns a list of all user tables from the SQL Server database.
-func getSourceTables(db *sql.DB) ([]string, error) {
-	query := "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME;"
-	rows, err := db.Query(query)
+// getTables retrieves a list of all user-defined tables from the SQL Server database.
+func getTables(db *sql.DB) ([]string, error) {
+	rows, err := db.Query("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_SCHEMA = 'dbo'")
 	if err != nil {
 		return nil, err
 	}
@@ -168,24 +314,28 @@ func getSourceTables(db *sql.DB) ([]string, error) {
 
 	var tables []string
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
+		var table string
+		if err := rows.Scan(&table); err != nil {
 			return nil, err
 		}
-		tables = append(tables, name)
+		tables = append(tables, table)
 	}
 	return tables, nil
 }
 
-// getTableSchema reads the schema of a specific table from SQL Server.
+// getTableSchema retrieves the schema for a specific table.
 func getTableSchema(db *sql.DB, tableName string) ([]ColumnSchema, error) {
 	query := `
 		SELECT 
-			COLUMN_NAME, DATA_TYPE, IS_NULLABLE, 
-			CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE
+			COLUMN_NAME, 
+			DATA_TYPE, 
+			IS_NULLABLE, 
+			CHARACTER_MAXIMUM_LENGTH,
+			NUMERIC_PRECISION,
+			NUMERIC_SCALE
 		FROM INFORMATION_SCHEMA.COLUMNS
 		WHERE TABLE_NAME = @p1
-		ORDER BY ORDINAL_POSITION;
+		ORDER BY ORDINAL_POSITION
 	`
 	rows, err := db.Query(query, tableName)
 	if err != nil {
@@ -204,69 +354,152 @@ func getTableSchema(db *sql.DB, tableName string) ([]ColumnSchema, error) {
 	return columns, nil
 }
 
-// getPrimaryKey returns the primary key columns for a given table.
-func getPrimaryKey(db *sql.DB, tableName string) ([]string, error) {
+// getPrimaryKey finds the primary key for a given table.
+func getPrimaryKey(db *sql.DB, tableName string) (PrimaryKeyInfo, error) {
 	query := `
-		SELECT k.COLUMN_NAME
-		FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS c
-		JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS k
-		ON c.CONSTRAINT_NAME = k.CONSTRAINT_NAME
-		WHERE c.TABLE_NAME = @p1 AND c.CONSTRAINT_TYPE = 'PRIMARY KEY'
-		ORDER BY k.ORDINAL_POSITION;
+		SELECT 
+			kcu.COLUMN_NAME,
+			col.DATA_TYPE
+		FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc
+		JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS kcu 
+			ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+			AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA
+			AND tc.TABLE_NAME = kcu.TABLE_NAME
+		JOIN INFORMATION_SCHEMA.COLUMNS AS col
+			ON kcu.COLUMN_NAME = col.COLUMN_NAME
+			AND kcu.TABLE_SCHEMA = col.TABLE_SCHEMA
+			AND kcu.TABLE_NAME = col.TABLE_NAME
+		WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY' AND tc.TABLE_NAME = @p1 AND tc.TABLE_SCHEMA = 'dbo'
 	`
-	rows, err := db.Query(query, tableName)
+	var pkColName, dataType string
+	err := db.QueryRow(query, tableName).Scan(&pkColName, &dataType)
 	if err != nil {
-		return nil, err
+		if err == sql.ErrNoRows {
+			return PrimaryKeyInfo{}, nil // No primary key found, not an error
+		}
+		return PrimaryKeyInfo{}, err
 	}
-	defer rows.Close()
 
-	var pkColumns []string
+	isNumeric := false
+	switch strings.ToLower(dataType) {
+	case "int", "smallint", "tinyint", "bigint":
+		isNumeric = true
+	}
+
+	return PrimaryKeyInfo{ColumnName: pkColName, IsNumeric: isNumeric}, nil
+}
+
+// copyData performs the actual data transfer from a result set to the destination table.
+func copyData(destDB *sql.DB, tableName string, rows *sql.Rows, bar *mpb.Bar) error {
+	columns, err := rows.Columns()
+	if err != nil {
+		return err
+	}
+	if len(columns) == 0 {
+		return nil // No columns in result set
+	}
+
+	// Use a transaction for batch inserts
+	tx, err := destDB.Begin()
+	if err != nil {
+		return err
+	}
+	// Defer a rollback. If the commit is successful, the rollback is a no-op.
+	defer tx.Rollback()
+
+	columnPlaceholders := strings.Repeat("?,", len(columns))
+	columnPlaceholders = columnPlaceholders[:len(columnPlaceholders)-1]
+
+	insertQuery := fmt.Sprintf(
+		"INSERT INTO `%s` (`%s`) VALUES (%s)",
+		tableName,
+		strings.Join(columns, "`,`"),
+		columnPlaceholders,
+	)
+
+	stmt, err := tx.Prepare(insertQuery)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	// Prepare for scanning rows
+	values := make([]interface{}, len(columns))
+	scanArgs := make([]interface{}, len(columns))
+	for i := range values {
+		scanArgs[i] = &values[i]
+	}
+
+	batchSize := 200 // Number of rows to insert in a single batch
+	batchCount := 0
+
 	for rows.Next() {
-		var colName string
-		if err := rows.Scan(&colName); err != nil {
-			return nil, err
+		if err := rows.Scan(scanArgs...); err != nil {
+			return err
 		}
-		pkColumns = append(pkColumns, colName)
+
+		if _, err := stmt.Exec(values...); err != nil {
+			return err
+		}
+		batchCount++
 	}
-	return pkColumns, nil
+
+	if err = rows.Err(); err != nil {
+		return err
+	}
+
+	// Commit the transaction
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+
+	bar.IncrBy(batchCount)
+	return nil
 }
 
-// generateCreateTableSQL generates the `CREATE TABLE` query for MySQL.
-func generateCreateTableSQL(tableName string, schema []ColumnSchema, primaryKeys []string) string {
-	var builder strings.Builder
-	builder.WriteString(fmt.Sprintf("CREATE TABLE `%s` (\n", tableName))
+// --- Statement Generation Functions ---
 
-	for i, col := range schema {
-		columnDef := fmt.Sprintf("  `%s` %s %s", col.Name, convertSQLServerTypeToMySQL(col), Ternary(col.IsNullable == "YES", "NULL", "NOT NULL"))
-		builder.WriteString(columnDef)
-		if i < len(schema)-1 || len(primaryKeys) > 0 {
-			builder.WriteString(",\n")
+// generateCreateTableStatement creates a MySQL-compatible CREATE TABLE statement.
+func generateCreateTableStatement(tableName string, columns []ColumnSchema, pkInfo PrimaryKeyInfo) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("CREATE TABLE `%s` (\n", tableName))
+
+	for i, col := range columns {
+		colDef := fmt.Sprintf("  `%s` %s %s",
+			col.Name,
+			convertSQLServerTypeToMySQL(col),
+			ternary(col.IsNullable == "YES", "NULL", "NOT NULL"),
+		)
+		sb.WriteString(colDef)
+		if i < len(columns)-1 {
+			sb.WriteString(",\n")
 		}
 	}
 
-	if len(primaryKeys) > 0 {
-		pkCols := strings.Join(primaryKeys, "`, `")
-		builder.WriteString(fmt.Sprintf("  PRIMARY KEY (`%s`)", pkCols))
+	if pkInfo.ColumnName != "" {
+		sb.WriteString(",\n")
+		sb.WriteString(fmt.Sprintf("  PRIMARY KEY (`%s`)", pkInfo.ColumnName))
 	}
 
-	builder.WriteString("\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;")
-	return builder.String()
+	sb.WriteString("\n) ENGINE=InnoDB CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;")
+	return sb.String()
 }
 
-// convertSQLServerTypeToMySQL converts a SQL Server data type to its MySQL equivalent.
+// convertSQLServerTypeToMySQL maps SQL Server data types to their MySQL equivalents.
 func convertSQLServerTypeToMySQL(col ColumnSchema) string {
 	switch strings.ToLower(col.Type) {
-	case "nvarchar", "varchar", "char", "nchar":
-		// Handle (n)varchar(max) which has a max length of -1 in SQL Server's metadata
+	case "nvarchar", "varchar", "char", "nchar", "text", "ntext":
 		if col.CharMaxLength.Valid && col.CharMaxLength.Int64 == -1 {
 			return "LONGTEXT"
 		}
-		if col.CharMaxLength.Valid && col.CharMaxLength.Int64 > 0 && col.CharMaxLength.Int64 <= 16383 {
+		if col.CharMaxLength.Valid && col.CharMaxLength.Int64 > 0 {
+			// Cap length to MySQL's max for VARCHAR
+			if col.CharMaxLength.Int64 > 16383 {
+				return "MEDIUMTEXT"
+			}
 			return fmt.Sprintf("VARCHAR(%d)", col.CharMaxLength.Int64)
 		}
 		return "TEXT"
-	case "text", "ntext":
-		return "LONGTEXT"
 	case "int":
 		return "INT"
 	case "smallint":
@@ -296,103 +529,26 @@ func convertSQLServerTypeToMySQL(col ColumnSchema) string {
 		return "TIME"
 	case "uniqueidentifier":
 		return "CHAR(36)"
-	case "binary", "varbinary", "image":
+	case "binary", "varbinary":
+		if col.CharMaxLength.Valid && col.CharMaxLength.Int64 == -1 {
+			return "LONGBLOB"
+		}
+		if col.CharMaxLength.Valid && col.CharMaxLength.Int64 > 0 {
+			if col.CharMaxLength.Int64 > 65535 {
+				return "MEDIUMBLOB"
+			}
+			return fmt.Sprintf("VARBINARY(%d)", col.CharMaxLength.Int64)
+		}
 		return "BLOB"
+	case "image":
+		return "LONGBLOB"
 	default:
 		return "TEXT"
 	}
 }
 
-// copyTableData copies data efficiently using batch inserts.
-func copyTableData(sourceDB, destDB *sql.DB, tableName string) error {
-	rows, err := sourceDB.Query(fmt.Sprintf("SELECT * FROM [%s];", tableName))
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	columns, err := rows.Columns()
-	if err != nil {
-		return err
-	}
-	if len(columns) == 0 {
-		return nil
-	}
-
-	valueArgs := make([]interface{}, len(columns))
-	scanArgs := make([]interface{}, len(columns))
-	for i := range valueArgs {
-		scanArgs[i] = &valueArgs[i]
-	}
-
-	tx, err := destDB.Begin()
-	if err != nil {
-		return err
-	}
-
-	totalRowsCopied := 0
-	batch := make([][]interface{}, 0, BATCH_SIZE)
-
-	for rows.Next() {
-		if err := rows.Scan(scanArgs...); err != nil {
-			tx.Rollback()
-			return err
-		}
-
-		rowData := make([]interface{}, len(columns))
-		copy(rowData, valueArgs)
-		batch = append(batch, rowData)
-
-		if len(batch) == BATCH_SIZE {
-			if err := insertBatch(tx, tableName, columns, batch); err != nil {
-				tx.Rollback()
-				return err
-			}
-			totalRowsCopied += len(batch)
-			batch = batch[:0] // Reset batch
-		}
-	}
-
-	// Insert any remaining rows
-	if len(batch) > 0 {
-		if err := insertBatch(tx, tableName, columns, batch); err != nil {
-			tx.Rollback()
-			return err
-		}
-		totalRowsCopied += len(batch)
-	}
-
-	if err := rows.Err(); err != nil {
-		tx.Rollback()
-		return err
-	}
-
-	fmt.Printf("    -> %d records copied.", totalRowsCopied)
-	return tx.Commit()
-}
-
-// insertBatch constructs and executes a multi-row INSERT statement.
-func insertBatch(tx *sql.Tx, tableName string, columns []string, batch [][]interface{}) error {
-	if len(batch) == 0 {
-		return nil
-	}
-
-	valueStrings := make([]string, 0, len(batch))
-	valueArgs := make([]interface{}, 0, len(batch)*len(columns))
-
-	for _, rowData := range batch {
-		valueStrings = append(valueStrings, "(?"+strings.Repeat(",?", len(columns)-1)+")")
-		valueArgs = append(valueArgs, rowData...)
-	}
-
-	stmt := fmt.Sprintf("INSERT INTO `%s` (`%s`) VALUES %s", tableName, strings.Join(columns, "`,`"), strings.Join(valueStrings, ","))
-
-	_, err := tx.Exec(stmt, valueArgs...)
-	return err
-}
-
-// Ternary is a simple helper for better readability, mimicking a ternary operator.
-func Ternary[T any](condition bool, trueVal, falseVal T) T {
+// ternary is a simple utility for inline conditional statements.
+func ternary(condition bool, trueVal, falseVal string) string {
 	if condition {
 		return trueVal
 	}
